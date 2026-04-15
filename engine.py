@@ -349,9 +349,10 @@ class VibeEngine:
             return_attention_mask=True,
         )
 
+        model_dtype = next(model.parameters()).dtype
         for k, v in inputs.items():
             if torch.is_tensor(v):
-                inputs[k] = v.to(self.device)
+                inputs[k] = v.to(device=self.device, dtype=model_dtype if v.is_floating_point() else None)
 
         with torch.no_grad():
             outputs = model.generate(
