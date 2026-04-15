@@ -23,6 +23,7 @@ class HardwareProfile:
     # Which models to load
     primary_model_id: str          # Main model for cloning / podcast
     realtime_model_id: str         # Always Realtime-0.5B for streaming interviews
+    dual_mode: bool                # TRUE if we should keep both in VRAM
     # Precision & optimisation
     dtype: torch.dtype
     quantize: Optional[str]        # "nf4" or None
@@ -48,13 +49,13 @@ def detect_hardware() -> HardwareProfile:
     high_density = os.getenv("HIGH_DENSITY", "0") == "1"
 
     if not torch.cuda.is_available():
-        print(_banner("CPU", 0, "low"))
         return HardwareProfile(
-            gpu_name="CPU (no CUDA)",
+            gpu_name="CPU",
             vram_gb=0,
             tier="low",
             primary_model_id=REALTIME_MODEL,
             realtime_model_id=REALTIME_MODEL,
+            dual_mode=False,
             dtype=torch.float32,
             quantize=None,
             use_compile=False,
@@ -67,7 +68,6 @@ def detect_hardware() -> HardwareProfile:
 
     if vram_gb >= VRAM_THRESHOLD_HIGH:
         # ── HIGH tier: RTX 4000 Ada / RTX 6000 / A100 ──────────────────────
-        # If high density is requested for 10-20 users, we use NF4 even on high-end cards
         tier = "high"
         quantize = "nf4" if high_density else None
         ddpm_steps = 3 if high_density else 10  # Drop steps to 3 for speed if busy
@@ -78,6 +78,7 @@ def detect_hardware() -> HardwareProfile:
             tier=tier,
             primary_model_id=FULL_MODEL,
             realtime_model_id=REALTIME_MODEL,
+            dual_mode=True,      # ENABLE DUAL MODE for 20GB+ cards
             dtype=torch.bfloat16,
             quantize=quantize,
             use_compile=True,
@@ -91,14 +92,14 @@ def detect_hardware() -> HardwareProfile:
             tier="low",
             primary_model_id=REALTIME_MODEL,
             realtime_model_id=REALTIME_MODEL,
+            dual_mode=False,
             dtype=torch.float16,
             quantize="nf4",
             use_compile=False,
             ddpm_steps=5,
         )
 
-    banner_tier = f"{profile.tier} (DENSITY MODE)" if high_density else profile.tier
-    print(_banner(gpu_name, vram_gb, banner_tier))
+    print(_banner(gpu_name, vram_gb, profile.tier, profile.dual_mode))
     return profile
 
 
@@ -115,7 +116,7 @@ def get_bnb_config():
 
 # ─── Pretty Print ──────────────────────────────────────────────────────────────
 
-def _banner(gpu: str, vram: float, tier: str) -> str:
+def _banner(gpu: str, vram: float, tier: str, dual: bool) -> str:
     bar = "═" * 60
     return (
         f"\n╔{bar}╗\n"
@@ -124,7 +125,7 @@ def _banner(gpu: str, vram: float, tier: str) -> str:
         f"║  GPU:    {gpu:<49}║\n"
         f"║  VRAM:   {vram:<49}║\n"
         f"║  Tier:   {tier.upper():<49}║\n"
-        f"║  Quant:  {'NF4 4-bit' if tier == 'low' and vram > 0 else 'None (full precision)':<49}║\n"
-        f"║  Compile: {'Enabled (reduce-overhead)' if tier == 'high' else 'Disabled':<49}║\n"
+        f"║  Engine: {'DUAL (0.5B + 1.5B)' if dual else 'SINGLE (Realtime)':<49}║\n"
+        f"║  Compile: {'Enabled' if tier == 'high' else 'Disabled':<49}║\n"
         f"╚{bar}╝"
     )

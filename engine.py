@@ -93,7 +93,8 @@ class VibeEngine:
         self._load_models()
 
         # ── Load default negative conditioning ─────────────────────────────
-        self._init_negative_conditioning()
+        # Initialize smart negatives asynchronously
+        asyncio.create_task(self._init_negative_conditioning())
 
         vram = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
         print(f"[Engine] Ready.  VRAM allocated: {vram:.2f} GB")
@@ -103,7 +104,7 @@ class VibeEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _load_models(self):
-        """Load model(s) based on hardware tier."""
+        """Load 0.5B and/or 1.5B models based on hardware tier."""
         from vibevoice.modular.modeling_vibevoice_streaming_inference import (
             VibeVoiceStreamingForConditionalGenerationInference,
         )
@@ -111,64 +112,139 @@ class VibeEngine:
             VibeVoiceStreamingProcessor,
         )
 
-        model_id = self.profile.primary_model_id
-        print(f"[Engine] Loading primary model: {model_id}  (tier={self.profile.tier})")
+        # 1. Load Premium Model (1.5B) if in High Tier or Dual Mode
+        if self.profile.tier == "high":
+            print(f"[Engine] Loading Premium Model (1.5B): {self.profile.primary_model_id}")
+            self.model_large = self._load_single_model(
+                self.profile.primary_model_id,
+                VibeVoiceStreamingForConditionalGenerationInference
+            )
+            self.processor_large = VibeVoiceStreamingProcessor.from_pretrained(self.profile.primary_model_id)
+        else:
+            self.model_large = None
+            self.processor_large = None
 
-        # ── Quantized loading (LOW tier) ────────────────────────────────────
+        # 2. Load Fast Model (0.5B)
+        if self.profile.dual_mode or self.profile.tier == "low":
+            print(f"[Engine] Loading Fast Model (0.5B): {self.profile.realtime_model_id}")
+            self.model_small = self._load_single_model(
+                self.profile.realtime_model_id,
+                VibeVoiceStreamingForConditionalGenerationInference
+            )
+            self.processor_small = VibeVoiceStreamingProcessor.from_pretrained(self.profile.realtime_model_id)
+        else:
+            self.model_small = None
+            self.processor_small = None
+
+    def _load_single_model(self, model_id, model_class):
+        """Helper to load a single model with correct precision/quantization."""
         if self.profile.quantize == "nf4":
-            bnb_config = get_bnb_config()
-            self.model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+            model = model_class.from_pretrained(
                 model_id,
-                quantization_config=bnb_config,
+                quantization_config=get_bnb_config(),
                 device_map="auto",
-                local_files_only=False,
             )
         else:
-            # ── Full-precision loading (HIGH tier) ──────────────────────────
-            self.model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+            model = model_class.from_pretrained(
                 model_id,
                 torch_dtype=self.profile.dtype,
                 device_map=self.device,
-                local_files_only=False,
             )
 
-        self.processor = VibeVoiceStreamingProcessor.from_pretrained(model_id)
-
-        # Enforce precision for non-quantized models
         if self.profile.quantize is None:
             if self.profile.dtype == torch.bfloat16:
-                self.model.bfloat16()
+                model.bfloat16()
             else:
-                self.model.half()
+                model.half()
 
-        self.model.eval()
-        self.model.set_ddpm_inference_steps(num_steps=self.profile.ddpm_steps)
+        model.eval()
+        model.set_ddpm_inference_steps(num_steps=self.profile.ddpm_steps)
 
-        # Noise scheduler — SDE-DPM-Solver++ for speed
-        self.model.model.noise_scheduler = self.model.model.noise_scheduler.from_config(
-            self.model.model.noise_scheduler.config,
+        # Noise scheduler
+        model.model.noise_scheduler = model.model.noise_scheduler.from_config(
+            model.model.noise_scheduler.config,
             algorithm_type="sde-dpmsolver++",
             beta_schedule="squaredcos_cap_v2",
         )
 
-        # Safety guards: prevent NaN scaling factors → silent output
-        if hasattr(self.model.model, "speech_scaling_factor"):
-            if torch.isnan(self.model.model.speech_scaling_factor).any():
-                print("[Engine] Warning: speech_scaling_factor is NaN → reset to 1.15")
-                self.model.model.speech_scaling_factor.fill_(1.15)
-        if hasattr(self.model.model, "speech_bias_factor"):
-            if torch.isnan(self.model.model.speech_bias_factor).any():
-                print("[Engine] Warning: speech_bias_factor is NaN → reset to 0.0")
-                self.model.model.speech_bias_factor.fill_(0.0)
-
-        # ── torch.compile (HIGH tier only) ──────────────────────────────────
+        # Apply torch.compile if requested
         if self.profile.use_compile:
-            print("[Engine] Applying torch.compile (mode=reduce-overhead)...")
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                print("[Engine] torch.compile applied successfully.")
+                model = torch.compile(model, mode="reduce-overhead")
             except Exception as e:
-                print(f"[Engine] torch.compile failed (non-fatal): {e}")
+                print(f"[Engine] Compile failed for {model_id}: {e}")
+
+        return model
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Negative Conditioning
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _init_negative_conditioning(self):
+        """
+        Dynamically extract negative conditioning for loaded models using silence.
+        This prevents 'dimension mismatch' errors because the extractor matches the model.
+        """
+        print("[Engine] Initializing smart negative conditioning...")
+        num_samples = int(24000 * 1.0) # 1 second
+        silence_np = np.zeros(num_samples, dtype=np.float32)
+
+        if self.model_large:
+            self._neg_large = await self._extract_internal_fingerprint(silence_np, self.model_large, "high")
+            print("[Engine] 1.5B Negative Conditioning: Initialized")
+
+        if self.model_small:
+            self._neg_small = await self._extract_internal_fingerprint(silence_np, self.model_small, "low")
+            print("[Engine] 0.5B Negative Conditioning: Initialized")
+
+    async def _extract_internal_fingerprint(self, audio_np: np.ndarray, model, tier: str) -> dict:
+        """Internal helper to extract fingerprint from numpy audio for a specific model."""
+        dtype = torch.bfloat16 if tier == "high" else torch.float16
+        speech_tensor = torch.from_numpy(audio_np).to(device=self.device, dtype=dtype).unsqueeze(0)
+
+        with torch.no_grad():
+            acoustic_out = model.acoustic_tokenizer.encode(speech_tensor.unsqueeze(1))
+            acoustic_latents = acoustic_out.mean
+            acoustic_embeds = model.acoustic_connector(acoustic_latents)
+
+            lm_out = model.forward_lm(inputs_embeds=acoustic_embeds, use_cache=True, return_dict=True)
+            speech_mask = torch.zeros((1, acoustic_latents.size(1)), dtype=torch.bool, device=self.device)
+            tts_lm_out = model.forward_tts_lm(
+                inputs_embeds=acoustic_embeds,
+                lm_last_hidden_state=lm_out.last_hidden_state,
+                tts_text_masks=speech_mask,
+                use_cache=True,
+                return_dict=True,
+            )
+
+        # Cast outputs to handle the dict-vs-object issue
+        return {
+            "lm": self._robust_half_explicit(lm_out, dtype),
+            "tts_lm": self._robust_half_explicit(tts_lm_out, dtype),
+        }
+
+    def _robust_half_explicit(self, obj, target_dtype):
+        """Cast tensors while preserving ModelOutput objects."""
+        if torch.is_tensor(obj):
+            return obj.to(dtype=target_dtype)
+        elif isinstance(obj, dict):
+            new_data = {k: self._robust_half_explicit(v, target_dtype) for k, v in obj.items()}
+            if hasattr(obj, "__class__") and obj.__class__ != dict:
+                try: return obj.__class__(new_data)
+                except Exception: return new_data
+            return new_data
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(self._robust_half_explicit(x, target_dtype) for x in obj)
+        elif hasattr(obj, "last_hidden_state"):
+            if obj.last_hidden_state is not None:
+                obj.last_hidden_state = obj.last_hidden_state.to(dtype=target_dtype)
+            if hasattr(obj, "past_key_values") and obj.past_key_values is not None:
+                pkv = obj.past_key_values
+                if hasattr(pkv, "key_cache"):
+                    try: obj.past_key_values = tuple(zip(pkv.key_cache, pkv.value_cache))
+                    except Exception: pass
+                obj.past_key_values = self._robust_half_explicit(obj.past_key_values, target_dtype)
+        return obj
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Negative Conditioning
@@ -183,33 +259,8 @@ class VibeEngine:
         self._neg_tts_lm = self._robust_half(carter_data["neg_tts_lm"])
 
     def _robust_half(self, obj):
-        """Recursively cast tensors; preserves ModelOutput classes to avoid 'dict' attribute errors."""
-        target_dtype = self.profile.dtype
-
-        if torch.is_tensor(obj):
-            return obj.to(dtype=target_dtype)
-        elif isinstance(obj, dict):
-            # Check if it's a ModelOutput or specialized dict
-            new_data = {k: self._robust_half(v) for k, v in obj.items()}
-            if hasattr(obj, "__class__") and obj.__class__ != dict:
-                try:
-                    return obj.__class__(new_data)
-                except Exception:
-                    return new_data
-            return new_data
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(self._robust_half(x) for x in obj)
-        elif hasattr(obj, "last_hidden_state"):
-            if obj.last_hidden_state is not None:
-                obj.last_hidden_state = obj.last_hidden_state.to(dtype=target_dtype)
-            if hasattr(obj, "past_key_values") and obj.past_key_values is not None:
-                pkv = obj.past_key_values
-                if hasattr(pkv, "key_cache"): # Handle DynamicCache
-                    try:
-                        obj.past_key_values = tuple(zip(pkv.key_cache, pkv.value_cache))
-                    except Exception: pass
-                obj.past_key_values = self._robust_half(obj.past_key_values)
-        return obj
+        """Deprecated: Use _robust_half_explicit with target_dtype for Dual-Engine."""
+        return self._robust_half_explicit(obj, self.profile.dtype)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Voice Presets
@@ -247,42 +298,28 @@ class VibeEngine:
     # Zero-Shot Fingerprint Extraction
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def get_fingerprint(self, audio_data: bytes) -> dict:
-        """
-        Extract a zero-shot voice embedding (fingerprint) from raw audio bytes.
-        Supports .wav and .mp3 inputs.
-        """
-        # 1. Decode & Resample to 24 kHz mono
+    async def get_fingerprint(self, audio_data: bytes, tier: str = "fast") -> dict:
+        """Extract a fingerprint using either the 'fast' (0.5B) or 'premium' (1.5B) model."""
+        model = self.model_large if tier == "premium" and self.model_large else self.model_small
+        if not model:
+            print(f"[Engine] Warning: Requested {tier} model not loaded. Falling back.")
+            model = self.model_small if self.model_small else self.model_large
+
         audio_np = self._decode_audio(audio_data)
+        dtype = torch.bfloat16 if model == self.model_large else torch.float16
 
-        # 2. Tensor preparation
-        speech_tensor = torch.from_numpy(audio_np).to(
-            device=self.device, dtype=self.profile.dtype
-        )
+        speech_tensor = torch.from_numpy(audio_np).to(device=self.device, dtype=dtype)
         if speech_tensor.ndim == 1:
-            speech_tensor = speech_tensor.unsqueeze(0)  # (1, T)
+            speech_tensor = speech_tensor.unsqueeze(0)
 
-        # 3. Prefill (voice embedding extraction)
         with torch.no_grad():
-            # Acoustic encoder: (B, 1, T) → latents
-            acoustic_out = self.model.acoustic_tokenizer.encode(speech_tensor.unsqueeze(1))
+            acoustic_out = model.acoustic_tokenizer.encode(speech_tensor.unsqueeze(1))
             acoustic_latents = acoustic_out.mean
+            acoustic_embeds = model.acoustic_connector(acoustic_latents)
 
-            # Project into LM space
-            acoustic_embeds = self.model.acoustic_connector(acoustic_latents)
-
-            # Prefill bottom LM
-            lm_out = self.model.forward_lm(
-                inputs_embeds=acoustic_embeds,
-                use_cache=True,
-                return_dict=True,
-            )
-
-            # Prefill top TTS-LM
-            speech_mask = torch.zeros(
-                (1, acoustic_latents.size(1)), dtype=torch.bool, device=self.device
-            )
-            tts_lm_out = self.model.forward_tts_lm(
+            lm_out = model.forward_lm(inputs_embeds=acoustic_embeds, use_cache=True, return_dict=True)
+            speech_mask = torch.zeros((1, acoustic_latents.size(1)), dtype=torch.bool, device=self.device)
+            tts_lm_out = model.forward_tts_lm(
                 inputs_embeds=acoustic_embeds,
                 lm_last_hidden_state=lm_out.last_hidden_state,
                 tts_text_masks=speech_mask,
@@ -290,17 +327,14 @@ class VibeEngine:
                 return_dict=True,
             )
 
+        neg = self._neg_large if model == self.model_large else self._neg_small
+
         fingerprint = {
-            "lm": lm_out,
-            "tts_lm": tts_lm_out,
-            "neg_lm": self._neg_lm,
-            "neg_tts_lm": self._neg_tts_lm,
+            "lm": self._robust_half_explicit(lm_out, dtype),
+            "tts_lm": self._robust_half_explicit(tts_lm_out, dtype),
+            "neg_lm": neg["lm"],
+            "neg_tts_lm": neg["tts_lm"],
         }
-
-        # Free VRAM on constrained cards
-        if self.profile.tier == "low":
-            torch.cuda.empty_cache()
-
         return fingerprint
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -311,16 +345,16 @@ class VibeEngine:
         self,
         text: str,
         fingerprint: dict,
+        tier: str = "fast",
         output_format: str = "wav",
         cfg_scale: float = 1.5,
     ) -> bytes:
-        """
-        Synthesise text into a specific voice.  Returns WAV or MP3 bytes.
-        Used by the Cloner and Podcast endpoints.
-        """
-        prompt_copy = deepcopy(fingerprint)
+        """Synthesise text using the requested model tier."""
+        model = self.model_large if tier == "premium" and self.model_large else self.model_small
+        processor = self.processor_large if tier == "premium" and self.processor_large else self.processor_small
 
-        inputs = self.processor.process_input_with_cached_prompt(
+        prompt_copy = deepcopy(fingerprint)
+        inputs = processor.process_input_with_cached_prompt(
             text=text,
             cached_prompt=prompt_copy,
             padding=True,
@@ -333,11 +367,11 @@ class VibeEngine:
                 inputs[k] = v.to(self.device)
 
         with torch.no_grad():
-            outputs = self.model.generate(
+            outputs = model.generate(
                 **inputs,
                 max_new_tokens=1024,
                 cfg_scale=cfg_scale,
-                tokenizer=self.processor.tokenizer,
+                tokenizer=processor.tokenizer,
                 generation_config={"do_sample": False},
                 all_prefilled_outputs=prompt_copy,
                 is_prefill=False,
@@ -345,11 +379,6 @@ class VibeEngine:
             )
 
         audio_np = outputs.speech_outputs[0].cpu().to(torch.float32).numpy().squeeze()
-
-        # Free VRAM on constrained cards
-        if self.profile.tier == "low":
-            torch.cuda.empty_cache()
-
         return self._encode_audio(audio_np, output_format)
 
     # ═══════════════════════════════════════════════════════════════════════════

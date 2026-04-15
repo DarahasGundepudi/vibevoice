@@ -160,55 +160,47 @@ ALLOWED_AUDIO_TYPES = {
 async def cloner_generate(
     text: str = Form(..., description="Text to synthesise in the cloned voice"),
     voice: UploadFile = File(..., description="Reference voice sample (.wav or .mp3)"),
+    tier: str = Form("premium", description="Model tier: fast (0.5B) or premium (1.5B)"),
     format: str = Form("wav", description="Output format: wav or mp3"),
 ):
     """
-    Zero-shot voice cloning.
-
-    Upload a reference voice sample and text → get audio in that voice.
-    Extracts a voice embedding (fingerprint) from the sample then synthesises
-    the text using the diffusion head.
+    Zero-shot voice cloning with Dual-Engine support.
     """
     if not engine:
         raise HTTPException(503, "Engine still loading")
 
-    # Validate file type
-    ext = os.path.splitext(voice.filename or "")[1].lower()
-    if ext not in (".wav", ".mp3", ".ogg", ".flac"):
-        raise HTTPException(400, f"Unsupported audio format: {ext}.  Use .wav or .mp3")
-
     start = time.time()
-
     try:
-        # 1. Read uploaded audio
         audio_data = await voice.read()
-        print(f"[Cloner] Received {len(audio_data)} bytes from '{voice.filename}'")
+        print(f"[Cloner] Received {len(audio_data)} bytes. Tier: {tier}")
 
-        # 2. Extract zero-shot fingerprint
-        fingerprint = await engine.get_fingerprint(audio_data)
+        # 1. Extract fingerprint using the requested tier
+        fingerprint = await engine.get_fingerprint(audio_data, tier=tier)
         fp_time = time.time() - start
-        print(f"[Cloner] Fingerprint extracted in {fp_time:.2f}s")
 
-        # 3. Synthesise
+        # 2. Synthesise using the same tier
         audio_bytes = engine.generate_clone(
             text=text,
             fingerprint=fingerprint,
+            tier=tier,
             output_format=format,
         )
 
         total_time = time.time() - start
-        print(f"[Cloner] Generated {len(audio_bytes)} bytes in {total_time:.2f}s")
-
         content_type = "audio/mpeg" if format == "mp3" else "audio/wav"
         return StreamingResponse(
             iter([audio_bytes]),
             media_type=content_type,
             headers={
                 "X-Generation-Time": f"{total_time:.3f}",
-                "X-Hardware-Tier": hw_profile.tier,
-                "Content-Disposition": f'attachment; filename="clone_output.{format}"',
+                "X-Hardware-Tier": tier,
+                "Content-Disposition": f'attachment; filename="clone_{tier}.{format}"',
             },
         )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Cloning failed: {e}")
 
     except Exception as e:
         import traceback
@@ -535,7 +527,11 @@ async def index():
             <label>Text to Synthesise</label>
             <textarea id="textInput" rows="3" placeholder="Enter text to speak in the cloned voice..."></textarea>
 
-            <button class="btn-generate" id="generateBtn">Clone & Generate</button>
+            <div style="display: flex; gap: 1rem; margin-bottom: 1.5rem;">
+                <button class="btn-generate" id="btnFast" style="background: var(--border);">Fast (0.5B)</button>
+                <button class="btn-generate" id="btnPremium">Premium (1.5B)</button>
+            </div>
+            
             <div id="status"></div>
 
             <div class="audio-result" id="audioResult">
@@ -552,36 +548,42 @@ async def index():
         </div>
 
         <script>
-            const btn = document.getElementById('generateBtn');
             const status = document.getElementById('status');
+            const audioPlayer = document.getElementById('audioPlayer');
+            const audioResult = document.getElementById('audioResult');
 
-            btn.onclick = async () => {
+            const generate = async (tier) => {
                 const file = document.getElementById('voiceFile').files[0];
                 const text = document.getElementById('textInput').value;
                 if (!file || !text) { alert('Select a voice file and enter text'); return; }
 
-                status.innerText = 'Extracting fingerprint...';
-                btn.disabled = true;
+                status.innerText = `Calling ${tier} engine...`;
+                document.getElementById('btnFast').disabled = true;
+                document.getElementById('btnPremium').disabled = true;
 
                 const fd = new FormData();
                 fd.append('text', text);
                 fd.append('voice', file);
+                fd.append('tier', tier);
 
                 try {
                     const res = await fetch('/cloner/generate', { method: 'POST', body: fd });
                     if (!res.ok) throw new Error(await res.text());
 
                     const blob = await res.blob();
-                    const url = URL.createObjectURL(blob);
-                    document.getElementById('audioPlayer').src = url;
-                    document.getElementById('audioResult').classList.add('show');
-                    status.innerText = `Done in ${res.headers.get('X-Generation-Time')}s (${(blob.size/1024).toFixed(1)} KB)`;
+                    audioPlayer.src = URL.createObjectURL(blob);
+                    audioResult.classList.add('show');
+                    status.innerText = `[${tier.toUpperCase()}] Done in ${res.headers.get('X-Generation-Time')}s`;
                 } catch (e) {
                     status.innerText = 'Error: ' + e.message;
                 } finally {
-                    btn.disabled = false;
+                    document.getElementById('btnFast').disabled = false;
+                    document.getElementById('btnPremium').disabled = false;
                 }
             };
+
+            document.getElementById('btnFast').onclick = () => generate('fast');
+            document.getElementById('btnPremium').onclick = () => generate('premium');
         </script>
     </body>
     </html>
