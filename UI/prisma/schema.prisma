@@ -1,0 +1,184 @@
+// ─── Prisma Schema: The Vibe Suite ───────────────────────────────────────────
+// Production-ready schema for user management, credits, sessions & content
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── User & Auth ─────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  credits       Int       @default(3) // 3 free sessions on signup
+  region        String?   // auto-detected for pricing
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      AuthSession[]
+  interviews    InterviewSession[]
+  tutorSessions TutorSession[]
+  podcasts      PodcastJob[]
+  cloneVoices   ClonedVoice[]
+  generations   GenerationHistory[]
+  payments      Payment[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model AuthSession {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("auth_sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ─── Payments ────────────────────────────────────────────────────────────────
+
+model Payment {
+  id              String   @id @default(cuid())
+  userId          String
+  stripeSessionId String?  @unique
+  amount          Int      // in smallest currency unit (paise, cents)
+  currency        String   // "INR", "USD", etc.
+  creditsPurchased Int
+  status          String   @default("pending") // pending, completed, failed
+  createdAt       DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+// ─── Interview Sessions ──────────────────────────────────────────────────────
+
+model InterviewSession {
+  id           String   @id @default(cuid())
+  userId       String
+  resumeText   String   @db.Text
+  jobDescription String @db.Text
+  persona      String   @default("professional") // professional, friendly, tough
+  transcript   Json?    // array of {role, content, timestamp}
+  score        Int?     // 0-100 post-interview
+  feedback     String?  @db.Text
+  durationSecs Int?
+  status       String   @default("active") // active, completed, cancelled
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("interview_sessions")
+}
+
+// ─── Tutor Sessions ──────────────────────────────────────────────────────────
+
+model TutorSession {
+  id           String   @id @default(cuid())
+  userId       String
+  language     String   // "french", "japanese", etc.
+  difficulty   String   @default("beginner") // beginner, intermediate, advanced
+  topic        String?
+  transcript   Json?
+  durationSecs Int?
+  status       String   @default("active")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("tutor_sessions")
+}
+
+// ─── Podcast Jobs ────────────────────────────────────────────────────────────
+
+model PodcastJob {
+  id           String   @id @default(cuid())
+  userId       String
+  sourceText   String   @db.Text // blog post, article, etc.
+  speakerCount Int      @default(2)
+  script       String?  @db.Text // LLM-generated podcast script
+  audioUrl     String?  // URL to generated audio file
+  durationSecs Int?
+  status       String   @default("queued") // queued, generating, completed, failed
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("podcast_jobs")
+}
+
+// ─── Cloned Voices ───────────────────────────────────────────────────────────
+
+model ClonedVoice {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  language    String   @default("en")
+  sampleUrl   String   // path to uploaded voice sample
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("cloned_voices")
+}
+
+// ─── Generation History (Clone / TTS outputs) ────────────────────────────────
+
+model GenerationHistory {
+  id          String   @id @default(cuid())
+  userId      String
+  tool        String   // "clone", "podcast", "interview", "tutor"
+  voiceUsed   String?
+  inputText   String   @db.Text
+  audioUrl    String?  // path to generated audio file
+  metadata    Json?    // extra tool-specific data (score, language, etc.)
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("generation_history")
+}

@@ -50,6 +50,21 @@ from engine import VibeEngine
 # podcast and interviewer are imported inside their endpoint functions
 
 # ─── Global State ──────────────────────────────────────────────────────────────
+from dataclasses import dataclass, field
+import uuid
+
+@dataclass
+class CloneTask:
+    task_id: str
+    status: str = "processing"   # processing | complete | failed
+    error: Optional[str] = None
+    audio_bytes: Optional[bytes] = None
+    tier: str = "fast"
+    format: str = "wav"
+    created_at: float = field(default_factory=time.time)
+
+# Global task registries
+_clone_tasks: dict[str, CloneTask] = {}
 
 engine: Optional[VibeEngine] = None
 hw_profile: Optional[HardwareProfile] = None
@@ -138,10 +153,23 @@ async def health():
 
 @app.get("/voices")
 async def list_voices():
-    """List all available voice presets."""
+    """List all available voice presets with rich metadata."""
     if not engine:
         raise HTTPException(503, "Engine not ready")
-    return {"voices": engine.get_available_voices()}
+    
+    presets = engine.get_available_voices()
+    formatted = []
+    
+    for name, meta in presets.items():
+        formatted.append({
+            "id": name,
+            "name": name.split(" (")[0], # "Carter (US Male)" -> "Carter"
+            "gender": meta.get("gender"),
+            "lang": meta.get("lang"),
+            "type": "preset"
+        })
+    
+    return {"voices": formatted}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -156,56 +184,102 @@ ALLOWED_AUDIO_TYPES = {
 }
 
 
+async def cloner_background_synthesis(task: CloneTask, audio_data: Optional[bytes], text: str, preset_name: Optional[str] = None):
+    """Background task to extract fingerprint (or load preset) and synthesise audio."""
+    try:
+        if preset_name:
+            # 1. Load preset
+            print(f"[Cloner] [{task.task_id}] Loading preset: {preset_name}")
+            fingerprint = engine.load_voice_preset(preset_name)
+        else:
+            # 1. Extract fingerprint from uploaded audio
+            print(f"[Cloner] [{task.task_id}] Extracting fingerprint (tier: {task.tier})...")
+            fingerprint = await engine.get_fingerprint(audio_data, tier=task.tier)
+
+        # 2. Synthesise
+        print(f"[Cloner] [{task.task_id}] Synthesising text...")
+        audio_bytes = engine.generate_clone(
+            text=text,
+            fingerprint=fingerprint,
+            tier=task.tier,
+            output_format=task.format,
+        )
+
+        task.audio_bytes = audio_bytes
+        task.status = "complete"
+        print(f"[Cloner] [{task.task_id}] Task complete.")
+    except Exception as e:
+        task.status = "failed"
+        task.error = str(e)
+        import traceback
+        traceback.print_exc()
+
 @app.post("/cloner/generate")
 async def cloner_generate(
+    background_tasks: BackgroundTasks,
     text: str = Form(..., description="Text to synthesise in the cloned voice"),
-    voice: UploadFile = File(..., description="Reference voice sample (.wav or .mp3)"),
+    voice: Optional[UploadFile] = File(None, description="Reference voice sample (.wav or .mp3)"),
+    preset: Optional[str] = Form(None, description="Built-in preset name to use"),
     tier: str = Form("premium", description="Model tier: fast (0.5B) or premium (1.5B)"),
     format: str = Form("wav", description="Output format: wav or mp3"),
 ):
     """
-    Zero-shot voice cloning with Dual-Engine support.
+    Asynchronous voice cloning or preset synthesis.
     """
     if not engine:
         raise HTTPException(503, "Engine still loading")
 
-    start = time.time()
-    try:
+    if not voice and not preset:
+        raise HTTPException(400, "Must provide either a 'voice' file or a 'preset' name")
+
+    audio_data = None
+    if voice:
         audio_data = await voice.read()
-        print(f"[Cloner] Received {len(audio_data)} bytes. Tier: {tier}")
 
-        # 1. Extract fingerprint using the requested tier
-        fingerprint = await engine.get_fingerprint(audio_data, tier=tier)
-        fp_time = time.time() - start
+    task_id = uuid.uuid4().hex[:12]
+    task = CloneTask(task_id=task_id, tier=tier, format=format)
+    _clone_tasks[task_id] = task
 
-        # 2. Synthesise using the same tier
-        audio_bytes = engine.generate_clone(
-            text=text,
-            fingerprint=fingerprint,
-            tier=tier,
-            output_format=format,
-        )
+    background_tasks.add_task(cloner_background_synthesis, task, audio_data, text, preset)
 
-        total_time = time.time() - start
-        content_type = "audio/mpeg" if format == "mp3" else "audio/wav"
-        return StreamingResponse(
-            iter([audio_bytes]),
-            media_type=content_type,
-            headers={
-                "X-Generation-Time": f"{total_time:.3f}",
-                "X-Hardware-Tier": tier,
-                "Content-Disposition": f'attachment; filename="clone_{tier}.{format}"',
-            },
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Cloning failed: {e}")
+    return {
+        "task_id": task_id,
+        "status": "processing",
+        "poll_url": f"/cloner/status/{task_id}"
+    }
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Cloning failed: {e}")
+@app.get("/cloner/status/{task_id}")
+async def cloner_status(task_id: str):
+    """Check the status of a cloning task."""
+    task = _clone_tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    result = {"task_id": task_id, "status": task.status}
+    if task.status == "complete":
+        result["download_url"] = f"/cloner/download/{task_id}"
+    elif task.status == "failed":
+        result["error"] = task.error
+
+    return result
+
+@app.get("/cloner/download/{task_id}")
+async def cloner_download(task_id: str):
+    """Download the result of a finished cloning task."""
+    task = _clone_tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task.status != "complete" or not task.audio_bytes:
+        raise HTTPException(400, "Audio not ready")
+
+    content_type = "audio/mpeg" if task.format == "mp3" else "audio/wav"
+    return StreamingResponse(
+        iter([task.audio_bytes]),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="clone_{task_id}.{task.format}"',
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -563,7 +637,7 @@ async def index():
                 const text = document.getElementById('textInput').value;
                 if (!file || !text) { alert('Select a voice file and enter text'); return; }
 
-                status.innerText = `Calling ${tier.toUpperCase()} engine... this may take 30-60s.`;
+                status.innerText = `Preparing ${tier.toUpperCase()} engine...`;
                 document.getElementById('btnFast').disabled = true;
                 document.getElementById('btnPremium').disabled = true;
 
@@ -574,25 +648,48 @@ async def index():
 
                 try {
                     const res = await fetch('/cloner/generate', { method: 'POST', body: fd });
-                    if (!res.ok) {
-                        const errText = await res.text();
-                        throw new Error(errText || 'Connection lost - check RunPod logs.');
-                    }
+                    if (!res.ok) throw new Error(await res.text() || 'Submission failed');
 
-                    const blob = await res.blob();
-                    const url = URL.createObjectURL(blob);
-                    audioPlayer.src = url;
-                    downloadLink.href = url;
-                    downloadLink.download = `clone_${tier}_${Date.now()}.wav`;
-                    audioResult.classList.add('show');
-                    status.innerText = `[${tier.toUpperCase()}] Generation Complete!`;
+                    const data = await res.json();
+                    const taskId = data.task_id;
                     
-                    // Auto-play is often blocked by browsers, but we set the player ready
-                    audioPlayer.load();
+                    // Start polling
+                    let startTime = Date.now();
+                    const poll = setInterval(async () => {
+                        try {
+                            const sRes = await fetch(`/cloner/status/${taskId}`);
+                            const sData = await sRes.json();
+                            
+                            let elapsed = Math.round((Date.now() - startTime) / 1000);
+                            status.innerText = `Synthesizing (${tier})... ${elapsed}s elapsed`;
+
+                            if (sData.status === 'complete') {
+                                clearInterval(poll);
+                                status.innerText = `[${tier.toUpperCase()}] Complete!`;
+                                
+                                const downloadUrl = `/cloner/download/${taskId}`;
+                                audioPlayer.src = downloadUrl;
+                                downloadLink.href = downloadUrl;
+                                downloadLink.download = `clone_${tier}_${taskId}.wav`;
+                                audioResult.classList.add('show');
+                                audioPlayer.load();
+                                
+                                document.getElementById('btnFast').disabled = false;
+                                document.getElementById('btnPremium').disabled = false;
+                            } else if (sData.status === 'failed') {
+                                clearInterval(poll);
+                                throw new Error(sData.error || 'Generation failed');
+                            }
+                        } catch (err) {
+                            clearInterval(poll);
+                            status.innerText = '⚠️ ' + err.message;
+                            document.getElementById('btnFast').disabled = false;
+                            document.getElementById('btnPremium').disabled = false;
+                        }
+                    }, 1500);
+
                 } catch (e) {
                     status.innerText = '⚠️ ' + e.message;
-                    console.error(e);
-                } finally {
                     document.getElementById('btnFast').disabled = false;
                     document.getElementById('btnPremium').disabled = false;
                 }

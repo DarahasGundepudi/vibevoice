@@ -67,7 +67,7 @@ VOICE_PRESETS = {
 }
 
 PRESET_BASE_URL = "https://raw.githubusercontent.com/microsoft/VibeVoice/main/demo/voices/streaming_model"
-PRESET_CACHE_DIR = os.path.join(os.path.dirname(__file__), "voice_presets")
+PRESET_CACHE_DIR = os.path.join(os.path.dirname(__file__), "voices", "streaming_model")
 
 
 # ─── Engine ────────────────────────────────────────────────────────────────────
