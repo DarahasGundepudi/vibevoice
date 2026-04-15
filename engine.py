@@ -246,21 +246,7 @@ class VibeEngine:
                 obj.past_key_values = self._robust_half_explicit(obj.past_key_values, target_dtype)
         return obj
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Negative Conditioning
-    # ═══════════════════════════════════════════════════════════════════════════
 
-    def _init_negative_conditioning(self):
-        """Load Carter preset as default negative conditioning for CFG."""
-        carter_path = self._ensure_preset_file("en-Carter_man.pt")
-        carter_data = torch.load(carter_path, map_location=self.device, weights_only=False)
-
-        self._neg_lm     = self._robust_half(carter_data["neg_lm"])
-        self._neg_tts_lm = self._robust_half(carter_data["neg_tts_lm"])
-
-    def _robust_half(self, obj):
-        """Deprecated: Use _robust_half_explicit with target_dtype for Dual-Engine."""
-        return self._robust_half_explicit(obj, self.profile.dtype)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Voice Presets
