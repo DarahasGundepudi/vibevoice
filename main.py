@@ -536,8 +536,11 @@ async def index():
 
             <div class="audio-result" id="audioResult">
                 <label>Result</label>
-                <audio id="audioPlayer" controls></audio>
-                <a id="downloadLink" class="btn-generate" style="display: block; text-align: center; margin-top: 1rem; text-decoration: none; background: var(--success);">Download Voice</a>
+                <audio id="audioPlayer" controls style="display: none;"></audio>
+                <div style="display: flex; gap: 1rem; margin-top: 1rem;">
+                    <button class="btn-generate" id="playBtn" style="background: var(--accent);">Play Audio</button>
+                    <a id="downloadLink" class="btn-generate" style="flex: 1; text-align: center; text-decoration: none; background: var(--success);">Download</a>
+                </div>
             </div>
 
             <div class="endpoints">
@@ -553,6 +556,7 @@ async def index():
             const audioPlayer = document.getElementById('audioPlayer');
             const audioResult = document.getElementById('audioResult');
             const downloadLink = document.getElementById('downloadLink');
+            const playBtn = document.getElementById('playBtn');
 
             const generate = async (tier) => {
                 const file = document.getElementById('voiceFile').files[0];
@@ -582,6 +586,9 @@ async def index():
                     downloadLink.download = `clone_${tier}_${Date.now()}.wav`;
                     audioResult.classList.add('show');
                     status.innerText = `[${tier.toUpperCase()}] Generation Complete!`;
+                    
+                    // Auto-play is often blocked by browsers, but we set the player ready
+                    audioPlayer.load();
                 } catch (e) {
                     status.innerText = '⚠️ ' + e.message;
                     console.error(e);
@@ -589,6 +596,10 @@ async def index():
                     document.getElementById('btnFast').disabled = false;
                     document.getElementById('btnPremium').disabled = false;
                 }
+            };
+
+            playBtn.onclick = () => {
+                if (audioPlayer.src) audioPlayer.play();
             };
 
             document.getElementById('btnFast').onclick = () => generate('fast');
