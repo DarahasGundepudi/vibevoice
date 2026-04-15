@@ -158,7 +158,9 @@ class VibeEngine:
                 model.half()
 
         model.eval()
-        model.set_ddpm_inference_steps(num_steps=self.profile.ddpm_steps)
+        # Set steps: Fast model = 5 steps (Turbo), Premium = 10 steps (Quality)
+        steps = 5 if model_id == self.profile.realtime_model_id else 10
+        model.set_ddpm_inference_steps(num_steps=steps)
 
         # Noise scheduler
         model.model.noise_scheduler = model.model.noise_scheduler.from_config(

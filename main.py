@@ -537,6 +537,7 @@ async def index():
             <div class="audio-result" id="audioResult">
                 <label>Result</label>
                 <audio id="audioPlayer" controls></audio>
+                <a id="downloadLink" class="btn-generate" style="display: block; text-align: center; margin-top: 1rem; text-decoration: none; background: var(--success);">Download Voice</a>
             </div>
 
             <div class="endpoints">
@@ -551,13 +552,14 @@ async def index():
             const status = document.getElementById('status');
             const audioPlayer = document.getElementById('audioPlayer');
             const audioResult = document.getElementById('audioResult');
+            const downloadLink = document.getElementById('downloadLink');
 
             const generate = async (tier) => {
                 const file = document.getElementById('voiceFile').files[0];
                 const text = document.getElementById('textInput').value;
                 if (!file || !text) { alert('Select a voice file and enter text'); return; }
 
-                status.innerText = `Calling ${tier} engine...`;
+                status.innerText = `Calling ${tier.toUpperCase()} engine... this may take 30-60s.`;
                 document.getElementById('btnFast').disabled = true;
                 document.getElementById('btnPremium').disabled = true;
 
@@ -568,14 +570,21 @@ async def index():
 
                 try {
                     const res = await fetch('/cloner/generate', { method: 'POST', body: fd });
-                    if (!res.ok) throw new Error(await res.text());
+                    if (!res.ok) {
+                        const errText = await res.text();
+                        throw new Error(errText || 'Connection lost - check RunPod logs.');
+                    }
 
                     const blob = await res.blob();
-                    audioPlayer.src = URL.createObjectURL(blob);
+                    const url = URL.createObjectURL(blob);
+                    audioPlayer.src = url;
+                    downloadLink.href = url;
+                    downloadLink.download = `clone_${tier}_${Date.now()}.wav`;
                     audioResult.classList.add('show');
-                    status.innerText = `[${tier.toUpperCase()}] Done in ${res.headers.get('X-Generation-Time')}s`;
+                    status.innerText = `[${tier.toUpperCase()}] Generation Complete!`;
                 } catch (e) {
-                    status.innerText = 'Error: ' + e.message;
+                    status.innerText = '⚠️ ' + e.message;
+                    console.error(e);
                 } finally {
                     document.getElementById('btnFast').disabled = false;
                     document.getElementById('btnPremium').disabled = false;
