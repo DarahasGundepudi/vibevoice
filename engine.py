@@ -220,8 +220,8 @@ class VibeEngine:
 
         # Cast outputs to handle the dict-vs-object issue
         return {
-            "lm": self._robust_half_explicit(lm_out, dtype),
-            "tts_lm": self._robust_half_explicit(tts_lm_out, dtype),
+            "lm": self._robust_half_explicit(lm_out, model_dtype),
+            "tts_lm": self._robust_half_explicit(tts_lm_out, model_dtype),
         }
 
     def _robust_half_explicit(self, obj, target_dtype):
