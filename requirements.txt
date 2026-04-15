@@ -1,0 +1,44 @@
+# ─── VibeVoice AI Audio Engine: Dependencies ─────────────────────────────────
+# Compatible with CUDA 12.6+ (from nvcr.io/nvidia/pytorch:25.04-py3)
+
+# Core ML
+torch>=2.1.0
+transformers>=4.51.3,<5.0.0
+accelerate
+diffusers
+safetensors
+einops
+bitsandbytes>=0.43.0
+
+# Audio Processing
+librosa
+soundfile
+scipy
+numpy
+pydub
+numba>=0.57.0
+llvmlite>=0.40.0
+
+# ASR (Interviewer)
+faster-whisper>=1.0.0
+
+# Server
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+websockets
+
+# LLM / Gemini (Podcast + Interviewer)
+google-genai
+
+# Article extraction (Podcast)
+httpx
+trafilatura
+
+# Utilities
+python-dotenv
+huggingface-hub
+tqdm
+ml-collections
+absl-py
