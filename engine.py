@@ -183,13 +183,20 @@ class VibeEngine:
         self._neg_tts_lm = self._robust_half(carter_data["neg_tts_lm"])
 
     def _robust_half(self, obj):
-        """Recursively cast tensors / ModelOutput / DynamicCache to engine dtype."""
+        """Recursively cast tensors; preserves ModelOutput classes to avoid 'dict' attribute errors."""
         target_dtype = self.profile.dtype
 
         if torch.is_tensor(obj):
             return obj.to(dtype=target_dtype)
         elif isinstance(obj, dict):
-            return {k: self._robust_half(v) for k, v in obj.items()}
+            # Check if it's a ModelOutput or specialized dict
+            new_data = {k: self._robust_half(v) for k, v in obj.items()}
+            if hasattr(obj, "__class__") and obj.__class__ != dict:
+                try:
+                    return obj.__class__(new_data)
+                except Exception:
+                    return new_data
+            return new_data
         elif isinstance(obj, (list, tuple)):
             return type(obj)(self._robust_half(x) for x in obj)
         elif hasattr(obj, "last_hidden_state"):
@@ -197,25 +204,11 @@ class VibeEngine:
                 obj.last_hidden_state = obj.last_hidden_state.to(dtype=target_dtype)
             if hasattr(obj, "past_key_values") and obj.past_key_values is not None:
                 pkv = obj.past_key_values
-                # Normalise DynamicCache → tuple-of-tuples
-                if hasattr(pkv, "key_cache") and hasattr(pkv, "value_cache"):
+                if hasattr(pkv, "key_cache"): # Handle DynamicCache
                     try:
                         obj.past_key_values = tuple(zip(pkv.key_cache, pkv.value_cache))
-                    except Exception:
-                        pass
-                elif hasattr(pkv, "to_legacy_cache"):
-                    try:
-                        obj.past_key_values = pkv.to_legacy_cache()
-                    except Exception:
-                        pass
-                # Cast all KV tensors
-                if isinstance(obj.past_key_values, (list, tuple)):
-                    obj.past_key_values = self._robust_half(obj.past_key_values)
-                    try:
-                        from transformers.cache_utils import DynamicCache
-                        obj.past_key_values = DynamicCache.from_legacy_cache(obj.past_key_values)
-                    except Exception:
-                        pass
+                    except Exception: pass
+                obj.past_key_values = self._robust_half(obj.past_key_values)
         return obj
 
     # ═══════════════════════════════════════════════════════════════════════════
