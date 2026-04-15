@@ -190,17 +190,18 @@ class VibeEngine:
         silence_np = np.zeros(num_samples, dtype=np.float32)
 
         if self.model_large:
-            self._neg_large = await self._extract_internal_fingerprint(silence_np, self.model_large, "high")
+            self._neg_large = await self._extract_internal_fingerprint(silence_np, self.model_large)
             print("[Engine] 1.5B Negative Conditioning: Initialized")
 
         if self.model_small:
-            self._neg_small = await self._extract_internal_fingerprint(silence_np, self.model_small, "low")
+            self._neg_small = await self._extract_internal_fingerprint(silence_np, self.model_small)
             print("[Engine] 0.5B Negative Conditioning: Initialized")
 
-    async def _extract_internal_fingerprint(self, audio_np: np.ndarray, model, tier: str) -> dict:
+    async def _extract_internal_fingerprint(self, audio_np: np.ndarray, model) -> dict:
         """Internal helper to extract fingerprint from numpy audio for a specific model."""
-        dtype = torch.bfloat16 if tier == "high" else torch.float16
-        speech_tensor = torch.from_numpy(audio_np).to(device=self.device, dtype=dtype).unsqueeze(0)
+        # Detect model's dtype dynamically to avoid mismatch errors
+        model_dtype = next(model.parameters()).dtype
+        speech_tensor = torch.from_numpy(audio_np).to(device=self.device, dtype=model_dtype).unsqueeze(0)
 
         with torch.no_grad():
             acoustic_out = model.acoustic_tokenizer.encode(speech_tensor.unsqueeze(1))
@@ -292,7 +293,7 @@ class VibeEngine:
             model = self.model_small if self.model_small else self.model_large
 
         audio_np = self._decode_audio(audio_data)
-        dtype = torch.bfloat16 if model == self.model_large else torch.float16
+        dtype = next(model.parameters()).dtype
 
         speech_tensor = torch.from_numpy(audio_np).to(device=self.device, dtype=dtype)
         if speech_tensor.ndim == 1:
